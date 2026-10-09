@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+tests/
+notes.db
+.env
+run.bat
+run.sh
+

@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+notes.db
+.pytest_cache/
+tempCodeRunnerFile*
+
