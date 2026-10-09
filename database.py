@@ -229,6 +229,59 @@ def get_user_by_id(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def ensure_user_exists(
+    db_path: str,
+    user_id: int,
+    username: Optional[str] = None,
+    email: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Ensures a user and their default Home folder exist in the database.
+    Crucial for ephemeral/serverless environments (like Vercel) where new container
+    instances start with a fresh SQLite database while the user retains a valid session cookie.
+    """
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, email FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            clean_username = (username or f"user_{user_id}").strip()
+            # If username is already taken by another user id in this fresh db, make unique
+            cursor.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (clean_username,))
+            if cursor.fetchone():
+                clean_username = f"{clean_username}_{user_id}"
+
+            clean_email = (email or f"{clean_username}@local").strip().lower()
+            cursor.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (clean_email,))
+            if cursor.fetchone():
+                clean_email = f"user_{user_id}_{clean_email}"
+
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            cursor.execute(
+                "INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, 'ephemeral_hash', ?)",
+                (user_id, clean_username, clean_email, now)
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO folders (user_id, name, parent_id, is_default) VALUES (?, 'Home', NULL, 1)",
+                (user_id,)
+            )
+            conn.commit()
+        else:
+            # Ensure Home folder exists for this user even if user record existed
+            cursor.execute(
+                "SELECT id FROM folders WHERE user_id = ? AND is_default = 1",
+                (user_id,)
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    "INSERT INTO folders (user_id, name, parent_id, is_default) VALUES (?, 'Home', NULL, 1)",
+                    (user_id,)
+                )
+                conn.commit()
+
+    return get_user_by_id(db_path, user_id) or {"id": user_id, "username": username or f"user_{user_id}"}
+
+
 def get_user_by_username_or_email(db_path: str, identifier: str) -> Optional[Dict[str, Any]]:
     """Retrieve full user details including password_hash for authentication."""
     clean = identifier.strip().lower()
@@ -541,6 +594,70 @@ def list_folders(db_path: str, user_id: Optional[int] = None) -> List[Dict[str, 
                 ordered_folders.append(f)
 
     return ordered_folders
+
+
+def sync_folders(db_path: str, folders_data: List[Dict[str, Any]], user_id: int) -> List[Dict[str, Any]]:
+    """
+    Syncs/restores folder hierarchy from client data for the given user.
+    Ensures that folders existing on the client are preserved on the server across serverless cold starts.
+    """
+    if not isinstance(folders_data, list):
+        return list_folders(db_path, user_id=user_id)
+
+    ensure_user_exists(db_path, user_id)
+
+    # Sort folders by depth or path length so parents are created before children
+    sorted_folders = sorted(
+        folders_data,
+        key=lambda f: (f.get("depth", 0), len(f.get("path", "") or ""))
+    )
+
+    name_to_id: Dict[str, int] = {}
+    current_folders = list_folders(db_path, user_id=user_id)
+    for cf in current_folders:
+        name_to_id[cf["name"].lower()] = cf["id"]
+        if cf.get("path"):
+            name_to_id[cf["path"].lower()] = cf["id"]
+
+    for f in sorted_folders:
+        if not isinstance(f, dict):
+            continue
+        name = (f.get("name") or "").strip()
+        if not name or name.lower() == "home":
+            continue
+
+        parent_id = None
+        path = (f.get("path") or "").strip()
+        if " / " in path:
+            parent_path = path.rsplit(" / ", 1)[0].strip().lower()
+            if parent_path in name_to_id:
+                parent_id = name_to_id[parent_path]
+        if parent_id is None:
+            raw_parent_id = f.get("parent_id")
+            parent_name = f.get("parent_name")
+            if parent_name and parent_name.lower() in name_to_id:
+                parent_id = name_to_id[parent_name.lower()]
+            elif raw_parent_id is not None:
+                existing_p = get_folder(db_path, raw_parent_id, user_id=user_id)
+                if existing_p:
+                    parent_id = raw_parent_id
+
+        # Check if folder already exists under this parent
+        existing = get_folder_by_name(db_path, name, parent_id, user_id=user_id)
+        if not existing:
+            try:
+                created = create_folder(db_path, name, parent_id=parent_id, user_id=user_id)
+                name_to_id[name.lower()] = created["id"]
+                if created.get("path"):
+                    name_to_id[created["path"].lower()] = created["id"]
+            except Exception:
+                pass
+        else:
+            name_to_id[name.lower()] = existing["id"]
+            if existing.get("path"):
+                name_to_id[existing["path"].lower()] = existing["id"]
+
+    return list_folders(db_path, user_id=user_id)
 
 
 def update_folder(
@@ -927,3 +1044,97 @@ def import_notes(db_path: str, notes_data: List[Dict[str, Any]], user_id: Option
         )
         imported_count += 1
     return imported_count
+
+
+def sync_notes(db_path: str, notes_data: List[Dict[str, Any]], user_id: int) -> List[Dict[str, Any]]:
+    """
+    Syncs/restores notes from client data for the given user without creating duplicates.
+    Ensures notes existing on the client are preserved on the server across serverless cold starts.
+    """
+    if not isinstance(notes_data, list):
+        return list_notes(db_path, user_id=user_id)
+
+    ensure_user_exists(db_path, user_id)
+    folders = list_folders(db_path, user_id=user_id)
+    folder_map: Dict[str, int] = {}
+    default_folder_id = 1
+    for f in folders:
+        if f.get("is_default"):
+            default_folder_id = f["id"]
+        folder_map[f["name"].lower()] = f["id"]
+        if f.get("path"):
+            folder_map[f["path"].lower()] = f["id"]
+
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, title, content, created_at FROM notes WHERE user_id = ?",
+            (user_id,)
+        )
+        existing_rows = cursor.fetchall()
+
+    existing_keys = set()
+    for row in existing_rows:
+        r_title = (row["title"] or "").strip().lower()
+        r_content = (row["content"] or "").strip()
+        r_created = (row["created_at"] or "").strip()
+        if r_created:
+            existing_keys.add((r_title, r_created))
+        existing_keys.add((r_title, r_content))
+
+    for item in notes_data:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "Untitled Note").strip()
+        content = item.get("content") or ""
+        created_at = (item.get("created_at") or "").strip()
+
+        key_created = (title.lower(), created_at) if created_at else None
+        key_content = (title.lower(), content.strip())
+
+        if (key_created and key_created in existing_keys) or (key_content in existing_keys):
+            continue
+
+        target_folder_id = default_folder_id
+        folder_path = (item.get("folder_path") or "").strip().lower()
+        folder_name = (item.get("folder_name") or "").strip().lower()
+        if folder_path and folder_path in folder_map:
+            target_folder_id = folder_map[folder_path]
+        elif folder_name and folder_name in folder_map:
+            target_folder_id = folder_map[folder_name]
+        elif item.get("folder_id") and get_folder(db_path, item["folder_id"], user_id=user_id):
+            target_folder_id = item["folder_id"]
+
+        tags = item.get("tags", "")
+        if isinstance(tags, list):
+            tags = ",".join(tags)
+        color = item.get("color", "default")
+        is_pinned = bool(item.get("is_pinned", False))
+        updated_at = item.get("updated_at")
+
+        new_note = create_note(
+            db_path,
+            title=title,
+            content=content,
+            tags=tags,
+            color=color,
+            is_pinned=is_pinned,
+            folder_id=target_folder_id,
+            user_id=user_id
+        )
+
+        if created_at or updated_at:
+            with get_connection(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE notes SET created_at = COALESCE(?, created_at), updated_at = COALESCE(?, updated_at) WHERE id = ?",
+                    (created_at or None, updated_at or None, new_note["id"])
+                )
+                conn.commit()
+
+        if key_created:
+            existing_keys.add(key_created)
+        existing_keys.add(key_content)
+
+    return list_notes(db_path, user_id=user_id)
+

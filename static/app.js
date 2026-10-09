@@ -336,6 +336,7 @@
         currentUser = data.user;
         updateUserUI();
         hideAuthModal();
+        restoreUserCachedData();
         await fetchFolders();
         await fetchNotes();
       } else {
@@ -378,6 +379,7 @@
       hideAuthModal();
       if (loginPassword) loginPassword.value = '';
       showToast(`Welcome back, ${currentUser.username}!`);
+      restoreUserCachedData();
       await fetchFolders();
       await fetchNotes();
     } catch (err) {
@@ -426,6 +428,7 @@
       hideAuthModal();
       if (registerPassword) registerPassword.value = '';
       showToast(`Welcome to SimpleNotes, ${currentUser.username}!`);
+      restoreUserCachedData();
       await fetchFolders();
       await fetchNotes();
     } catch (err) {
@@ -546,6 +549,12 @@
     } catch (err) {
       console.error('Logout error:', err);
     }
+    if (currentUser) {
+      try {
+        localStorage.removeItem(`simplenotes_folders_${currentUser.id}`);
+        localStorage.removeItem(`simplenotes_notes_${currentUser.id}`);
+      } catch (e) {}
+    }
     currentUser = null;
     updateUserUI();
     notes = [];
@@ -578,6 +587,91 @@
     setTheme(current === 'dark' ? 'light' : 'dark');
   });
 
+  // Cache & Offline Resilience Helpers
+  function saveFoldersToCache(foldersList) {
+    if (!currentUser || !Array.isArray(foldersList) || foldersList.length === 0) return;
+    try {
+      localStorage.setItem(`simplenotes_folders_${currentUser.id}`, JSON.stringify(foldersList));
+    } catch (e) {}
+  }
+
+  function getFoldersFromCache() {
+    if (!currentUser) return null;
+    try {
+      const data = localStorage.getItem(`simplenotes_folders_${currentUser.id}`);
+      return data ? JSON.parse(data) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveNotesToCache(notesList) {
+    if (!currentUser || !Array.isArray(notesList)) return;
+    try {
+      localStorage.setItem(`simplenotes_notes_${currentUser.id}`, JSON.stringify(notesList));
+    } catch (e) {}
+  }
+
+  function getNotesFromCache() {
+    if (!currentUser) return null;
+    try {
+      const data = localStorage.getItem(`simplenotes_notes_${currentUser.id}`);
+      return data ? JSON.parse(data) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function restoreUserCachedData() {
+    const cachedFolders = getFoldersFromCache();
+    if (cachedFolders && cachedFolders.length > 0) {
+      folders = cachedFolders;
+      renderFolders();
+      updateModalFolderSelect();
+      updateFolderParentSelect();
+      updateAllNotesCountBadge();
+    }
+    const cachedNotes = getNotesFromCache();
+    if (cachedNotes && cachedNotes.length > 0) {
+      notes = cachedNotes;
+      renderNotes();
+    }
+  }
+
+  async function syncFoldersToServer(foldersToSync) {
+    if (!foldersToSync || !Array.isArray(foldersToSync) || foldersToSync.length === 0) return null;
+    try {
+      const res = await fetch('/api/folders/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folders: foldersToSync })
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.warn('Folder sync to server error:', e);
+    }
+    return null;
+  }
+
+  async function syncNotesToServer(notesToSync) {
+    if (!notesToSync || !Array.isArray(notesToSync) || notesToSync.length === 0) return null;
+    try {
+      const res = await fetch('/api/notes/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes: notesToSync })
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.warn('Notes sync to server error:', e);
+    }
+    return null;
+  }
+
   // Fetch Notes from API
   async function fetchNotes() {
     try {
@@ -606,7 +700,44 @@
         return;
       }
       if (!res.ok) throw new Error('Failed to fetch notes');
-      notes = await res.json();
+      const serverNotes = await res.json();
+
+      const cachedNotes = getNotesFromCache() || [];
+      const currentLocalNotes = (notes && notes.length > 0) ? notes : cachedNotes;
+
+      if (activeFilter === 'all' && !hasQuery) {
+        if (Array.isArray(serverNotes) && serverNotes.length >= currentLocalNotes.length && serverNotes.length > 0) {
+          notes = serverNotes;
+          saveNotesToCache(notes);
+        } else if (currentLocalNotes.length > 0 && (!Array.isArray(serverNotes) || serverNotes.length < currentLocalNotes.length)) {
+          // Cold server container or missing notes: keep local notes and sync to server
+          notes = currentLocalNotes;
+          renderNotes();
+          const synced = await syncNotesToServer(currentLocalNotes);
+          if (Array.isArray(synced) && synced.length > 0) {
+            notes = synced;
+            saveNotesToCache(notes);
+          }
+        } else {
+          notes = serverNotes || [];
+          saveNotesToCache(notes);
+        }
+      } else if (activeFolderId !== null && !hasQuery) {
+        if (Array.isArray(serverNotes) && serverNotes.length > 0) {
+          notes = serverNotes;
+        } else {
+          const localFolderNotes = currentLocalNotes.filter(n => n.folder_id === activeFolderId);
+          if (localFolderNotes.length > 0) {
+            notes = localFolderNotes;
+            syncNotesToServer(currentLocalNotes);
+          } else {
+            notes = serverNotes || [];
+          }
+        }
+      } else {
+        notes = serverNotes || [];
+      }
+
       renderNotes();
       updateFilterLabel();
       fetchFolders();
@@ -625,11 +756,49 @@
         return;
       }
       if (!res.ok) return;
-      folders = await res.json();
-      renderFolders();
-      updateModalFolderSelect();
-      updateFolderParentSelect();
-      updateAllNotesCountBadge();
+      const serverFolders = await res.json();
+
+      const cached = getFoldersFromCache() || [];
+      const currentList = (folders && folders.length > 0) ? folders : cached;
+      const localCustom = currentList.filter(f => !f.is_default && (f.name || '').toLowerCase() !== 'home');
+      const serverCustom = (Array.isArray(serverFolders) ? serverFolders : []).filter(
+        f => !f.is_default && (f.name || '').toLowerCase() !== 'home'
+      );
+
+      const serverHasAll = serverCustom.length >= localCustom.length &&
+        localCustom.every(lf => serverCustom.some(sf => (sf.name || '').toLowerCase() === (lf.name || '').toLowerCase()));
+
+      if (localCustom.length > 0 && !serverHasAll) {
+        // Cold serverless instance: preserve local custom folders so sidebar never disappears
+        folders = currentList;
+        renderFolders();
+        updateModalFolderSelect();
+        updateFolderParentSelect();
+        updateAllNotesCountBadge();
+        const synced = await syncFoldersToServer(currentList);
+        if (Array.isArray(synced) && synced.length > 0) {
+          folders = synced;
+          saveFoldersToCache(folders);
+          renderFolders();
+          updateModalFolderSelect();
+          updateFolderParentSelect();
+          updateAllNotesCountBadge();
+        }
+      } else if (Array.isArray(serverFolders) && serverFolders.length > 0) {
+        folders = serverFolders;
+        saveFoldersToCache(folders);
+        renderFolders();
+        updateModalFolderSelect();
+        updateFolderParentSelect();
+        updateAllNotesCountBadge();
+      } else if (currentList.length > 0) {
+        folders = currentList;
+        renderFolders();
+        updateModalFolderSelect();
+        updateFolderParentSelect();
+        updateAllNotesCountBadge();
+        syncFoldersToServer(currentList);
+      }
     } catch (err) {
       console.error('Error fetching folders:', err);
     }
@@ -644,8 +813,13 @@
   function renderFolders() {
     if (!foldersListEl) return;
     if (!folders || folders.length === 0) {
-      foldersListEl.innerHTML = '<span class="sidebar-empty">No folders yet</span>';
-      return;
+      const cached = getFoldersFromCache();
+      if (cached && cached.length > 0) {
+        folders = cached;
+      } else {
+        foldersListEl.innerHTML = '<span class="sidebar-empty">No folders yet</span>';
+        return;
+      }
     }
 
     // Group folders by parent_id
@@ -993,6 +1167,9 @@
         try {
           const res = await fetch(`/api/notes/${noteId}/pin`, { method: 'POST' });
           if (!res.ok) throw new Error('Pin failed');
+          const updated = await res.json();
+          notes = notes.map((n) => (n.id === noteId ? { ...n, is_pinned: updated.is_pinned } : n));
+          saveNotesToCache(notes);
           fetchNotes();
         } catch (err) {
           console.error(err);
@@ -1029,6 +1206,7 @@
           if (cardLine) cardLine.classList.toggle('completed', isChecked);
 
           updateCardProgressBar(noteId, note.content);
+          saveNotesToCache(notes);
 
           try {
             await fetch(`/api/notes/${noteId}`, {
@@ -1847,6 +2025,13 @@
       }
 
       if (!res.ok) throw new Error('Failed to save');
+      const savedNote = await res.json();
+      if (currentEditingId) {
+        notes = notes.map((n) => (n.id === currentEditingId ? { ...n, ...savedNote } : n));
+      } else {
+        notes.unshift(savedNote);
+      }
+      saveNotesToCache(notes);
       showToast(currentEditingId ? 'Note updated successfully' : 'Note created successfully');
       closeModal();
       fetchNotes();
@@ -1864,6 +2049,8 @@
     try {
       const res = await fetch(`/api/notes/${currentEditingId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete');
+      notes = notes.filter((n) => n.id !== currentEditingId);
+      saveNotesToCache(notes);
       showToast('Note deleted');
       closeModal();
       fetchNotes();
@@ -1974,6 +2161,13 @@
         return;
       }
 
+      if (currentEditingFolderId) {
+        folders = folders.map((f) => (f.id === currentEditingFolderId ? { ...f, ...result } : f));
+      } else {
+        folders.push(result);
+      }
+      saveFoldersToCache(folders);
+
       showToast(currentEditingFolderId ? 'Folder updated' : `Folder "${name}" created`);
       closeFolderModal();
       await fetchFolders();
@@ -2002,6 +2196,15 @@
         showToast(result.error || 'Failed to delete folder');
         return;
       }
+
+      folders = folders.filter((f) => f.id !== folderId && f.parent_id !== folderId);
+      saveFoldersToCache(folders);
+      renderFolders();
+
+      const defaultFolder = folders.find((f) => f.is_default) || folders[0];
+      const defaultId = defaultFolder ? defaultFolder.id : 1;
+      notes = notes.map((n) => (n.folder_id === folderId ? { ...n, folder_id: defaultId, folder_name: 'Home' } : n));
+      saveNotesToCache(notes);
 
       showToast(`Folder "${folderName}" deleted. Notes moved to Home.`);
       if (activeFolderId === folderId) {
