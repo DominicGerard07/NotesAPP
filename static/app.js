@@ -1906,6 +1906,8 @@
       ...existing,
       ...payload,
       id: optimisticId,
+      folder_name: (folders.find((folder) => folder.id === folder_id) || {}).name || 'Home',
+      folder_path: (folders.find((folder) => folder.id === folder_id) || {}).path || 'Home',
       created_at: existing.created_at || new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
