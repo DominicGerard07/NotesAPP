@@ -821,105 +821,26 @@ class TestAuthenticationAndMultiTenancy(unittest.TestCase):
             mock_smtp.assert_called_once()
 
 
-    def test_serverless_cold_start_resilience_and_sync(self):
-        # 1. Container A: User registers, creates nested folders and notes
-        temp_dir_a = tempfile.mkdtemp()
-        db_path_a = os.path.join(temp_dir_a, "container_a.db")
-        app_a = create_app(db_path=db_path_a)
-        client_a = app_a.test_client()
+    def test_missing_session_user_is_rejected_without_recreation(self):
+        temp_dir = tempfile.mkdtemp()
+        db_path = os.path.join(temp_dir, "fresh_instance.db")
+        app = create_app(db_path=db_path)
+        client = app.test_client()
 
-        # Register user
-        reg_res = client_a.post("/api/auth/register", json={
-            "username": "syncuser",
-            "email": "syncuser@example.com",
-            "password": "password123"
-        })
-        self.assertEqual(reg_res.status_code, 201)
-        user_data = reg_res.get_json()["user"]
-        user_id = user_data["id"]
+        with client.session_transaction() as sess:
+            sess["user_id"] = 9876
+            sess["username"] = "missing-user"
 
-        # Create "Work" folder
-        f_work_res = client_a.post("/api/folders", json={"name": "Work", "parent_id": None})
-        self.assertEqual(f_work_res.status_code, 201)
-        work_folder = f_work_res.get_json()
+        response = client.get("/api/folders")
+        self.assertEqual(response.status_code, 401)
+        self.assertIsNone(database.get_user_by_id(db_path, 9876))
 
-        # Create "Projects" subfolder under "Work"
-        f_proj_res = client_a.post("/api/folders", json={"name": "Projects", "parent_id": work_folder["id"]})
-        self.assertEqual(f_proj_res.status_code, 201)
-        proj_folder = f_proj_res.get_json()
+        self.assertEqual(client.post("/api/folders/sync", json={"folders": []}).status_code, 404)
+        self.assertEqual(client.post("/api/notes/sync", json={"notes": []}).status_code, 404)
 
-        # Create note inside "Projects"
-        n_res = client_a.post("/api/notes", json={
-            "title": "Roadmap Note",
-            "content": "- [ ] Ship feature\n- [x] Write tests",
-            "folder_id": proj_folder["id"]
-        })
-        self.assertEqual(n_res.status_code, 201)
-
-        # Get folder and note state exported from Container A
-        folders_state = client_a.get("/api/folders").get_json()
-        notes_state = client_a.get("/api/notes").get_json()
-        self.assertEqual(len(folders_state), 3)  # Home, Work, Projects
-        self.assertEqual(len(notes_state), 1)
-
-        # 2. Container B: Simulates cold-start instance on Vercel with fresh SQLite database
-        temp_dir_b = tempfile.mkdtemp()
-        db_path_b = os.path.join(temp_dir_b, "container_b.db")
-        app_b = create_app(db_path=db_path_b)
-        client_b = app_b.test_client()
-
-        # Set user session cookie on client_b (session is cryptographically signed and shared across containers)
-        with client_b.session_transaction() as sess:
-            sess["user_id"] = user_id
-            sess["username"] = "syncuser"
-            sess["email"] = "syncuser@example.com"
-
-        # Request on fresh Container B triggers ensure_user_exists in login_required
-        f_get = client_b.get("/api/folders")
-        self.assertEqual(f_get.status_code, 200)
-        # Initially fresh container only has default Home
-        initial_folders = f_get.get_json()
-        self.assertEqual(len(initial_folders), 1)
-        self.assertEqual(initial_folders[0]["name"], "Home")
-
-        # Sync folders from client state to Container B
-        sync_f_res = client_b.post("/api/folders/sync", json={"folders": folders_state})
-        self.assertEqual(sync_f_res.status_code, 200)
-        synced_folders = sync_f_res.get_json()
-        synced_names = [f["name"] for f in synced_folders]
-        self.assertIn("Home", synced_names)
-        self.assertIn("Work", synced_names)
-        self.assertIn("Projects", synced_names)
-
-        # Verify nesting was preserved: "Projects" should have parent "Work"
-        synced_proj = next(f for f in synced_folders if f["name"] == "Projects")
-        synced_work = next(f for f in synced_folders if f["name"] == "Work")
-        self.assertEqual(synced_proj["parent_id"], synced_work["id"])
-
-        # Sync notes to Container B
-        sync_n_res = client_b.post("/api/notes/sync", json={"notes": notes_state})
-        self.assertEqual(sync_n_res.status_code, 200)
-        synced_notes = sync_n_res.get_json()
-        self.assertEqual(len(synced_notes), 1)
-        self.assertEqual(synced_notes[0]["title"], "Roadmap Note")
-        self.assertEqual(synced_notes[0]["folder_id"], synced_proj["id"])
-
-        # Verify re-syncing doesn't create duplicate notes
-        sync_n_res2 = client_b.post("/api/notes/sync", json={"notes": notes_state})
-        self.assertEqual(sync_n_res2.status_code, 200)
-        self.assertEqual(len(sync_n_res2.get_json()), 1)
-
-        # GET /api/folders on Container B now reports note_count = 1 for Projects
-        folders_after = client_b.get("/api/folders").get_json()
-        proj_after = next(f for f in folders_after if f["name"] == "Projects")
-        self.assertEqual(proj_after["note_count"], 1)
-
-        # Clean up temp directories
-        for p, d in [(db_path_a, temp_dir_a), (db_path_b, temp_dir_b)]:
-            if os.path.exists(p):
-                os.remove(p)
-            if os.path.exists(d):
-                os.rmdir(d)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        os.rmdir(temp_dir)
 
 
 if __name__ == "__main__":

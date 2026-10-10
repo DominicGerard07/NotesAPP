@@ -293,15 +293,6 @@ def create_app(db_path=None):
         database.delete_folder(app.config["DB_PATH"], folder_id, user_id=user_id)
         return jsonify({"success": True, "id": folder_id})
 
-    @app.route("/api/folders/sync", methods=["POST"])
-    @login_required
-    def sync_folders_route():
-        user_id = get_current_user_id()
-        data = request.get_json() or {}
-        folders_list = data.get("folders", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        folders = database.sync_folders(app.config["DB_PATH"], folders_list, user_id=user_id)
-        return jsonify(folders)
-
     # ---------------- Note Routes ----------------
 
     @app.route("/api/notes", methods=["GET"])
@@ -473,15 +464,6 @@ def create_app(db_path=None):
 
         count = database.import_notes(app.config["DB_PATH"], notes_list, user_id=user_id)
         return jsonify({"success": True, "imported": count})
-
-    @app.route("/api/notes/sync", methods=["POST"])
-    @login_required
-    def sync_notes_route():
-        user_id = get_current_user_id()
-        data = request.get_json() or {}
-        notes_list = data.get("notes", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        notes = database.sync_notes(app.config["DB_PATH"], notes_list, user_id=user_id)
-        return jsonify(notes)
 
     return app
 
