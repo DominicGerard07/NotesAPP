@@ -1,15 +1,39 @@
 import sqlite3
 import datetime
+import os
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Any, Generator
 from werkzeug.security import generate_password_hash
 
+TURSO_DB_PATH = "__turso_remote__"
+
 
 @contextmanager
-def get_connection(db_path: str) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+def get_connection(db_path: str) -> Generator[Any, None, None]:
+    if db_path == TURSO_DB_PATH:
+        try:
+            import turso_serverless
+        except ImportError as exc:
+            raise RuntimeError(
+                "Turso storage is configured, but the turso_serverless package is missing"
+            ) from exc
+        database_url = os.environ.get("TURSO_DATABASE_URL")
+        auth_token = os.environ.get("TURSO_AUTH_TOKEN")
+        if not database_url or not auth_token:
+            raise RuntimeError(
+                "Set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to use persistent storage"
+            )
+        conn = turso_serverless.connect(database_url, auth_token=auth_token)
+        try:
+            conn.row_factory = turso_serverless.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+        except Exception:
+            conn.close()
+            raise
+    else:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
     finally:
@@ -17,6 +41,10 @@ def get_connection(db_path: str) -> Generator[sqlite3.Connection, None, None]:
 
 
 def init_db(db_path: str) -> None:
+    if db_path == TURSO_DB_PATH:
+        _init_turso_db(db_path)
+        return
+
     with get_connection(db_path) as conn:
         # 1. Users table
         conn.execute("""
@@ -154,6 +182,97 @@ def init_db(db_path: str) -> None:
             conn.execute("ALTER TABLE notes ADD COLUMN user_id INTEGER DEFAULT NULL REFERENCES users(id)")
 
         conn.execute("UPDATE notes SET user_id = 1 WHERE user_id IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_pinned ON notes(is_pinned DESC, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)")
+        conn.commit()
+
+
+def is_integrity_error(error: Exception) -> bool:
+    """Recognize unique/foreign-key violations from local and remote SQLite drivers."""
+    error_types = [sqlite3.IntegrityError]
+    try:
+        import turso_serverless
+        error_types.append(turso_serverless.IntegrityError)
+    except ImportError:
+        pass
+    return isinstance(error, tuple(error_types))
+
+
+def _init_turso_db(db_path: str) -> None:
+    """Create the app schema in the persistent remote SQLite-compatible database."""
+    with get_connection(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL COLLATE NOCASE,
+                email TEXT UNIQUE NOT NULL COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(LOWER(username))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(LOWER(email))")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS password_resets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_password_resets_user_code ON password_resets(user_id, code)")
+
+        cursor = conn.execute("SELECT id FROM users LIMIT 1")
+        if cursor.fetchone() is None:
+            default_hash = generate_password_hash("demo123")
+            conn.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES (1, 'demo', 'demo@example.com', ?)",
+                (default_hash,)
+            )
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                name TEXT NOT NULL COLLATE NOCASE,
+                parent_id INTEGER DEFAULT NULL,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (parent_id) REFERENCES folders(id) ON DELETE SET NULL
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO folders (id, user_id, name, parent_id, is_default)
+            VALUES (1, 1, 'Home', NULL, 1)
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_user_parent_name
+            ON folders(COALESCE(user_id, 1), COALESCE(parent_id, 0), LOWER(name))
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                color TEXT NOT NULL DEFAULT 'default',
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                folder_id INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET DEFAULT
+            )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_pinned ON notes(is_pinned DESC, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)")

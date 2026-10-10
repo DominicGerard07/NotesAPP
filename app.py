@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import sqlite3
 import secrets
 import functools
 from flask import Flask, render_template, request, jsonify, session, Response
@@ -19,9 +18,19 @@ def create_app(db_path=None):
     )
 
     if db_path is None:
-        if os.environ.get("VERCEL"):
-            # On Vercel serverless functions, the root filesystem is read-only. /tmp is the only writable directory.
-            db_path = os.environ.get("NOTES_DB_PATH", os.path.join("/tmp", "notes.db"))
+        turso_url = os.environ.get("TURSO_DATABASE_URL")
+        turso_token = os.environ.get("TURSO_AUTH_TOKEN")
+        if turso_url or turso_token:
+            if not turso_url or not turso_token:
+                raise RuntimeError(
+                    "Persistent database setup is incomplete: set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN"
+                )
+            db_path = database.TURSO_DB_PATH
+        elif os.environ.get("VERCEL"):
+            raise RuntimeError(
+                "This app needs persistent storage on Vercel. Connect a Turso database and set "
+                "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; Vercel's /tmp directory is temporary."
+            )
         else:
             db_path = os.environ.get("NOTES_DB_PATH", os.path.join(project_root, "notes.db"))
 
@@ -39,11 +48,12 @@ def create_app(db_path=None):
         def decorated_function(*args, **kwargs):
             if "user_id" not in session or not session["user_id"]:
                 return jsonify({"error": "Authentication required", "logged_in": False}), 401
-            # Auto-provision user and their default Home folder on fresh/ephemeral serverless instances (Vercel)
             user_id = session.get("user_id")
-            username = session.get("username")
-            email = session.get("email")
-            database.ensure_user_exists(app.config["DB_PATH"], user_id, username=username, email=email)
+            if not database.get_user_by_id(app.config["DB_PATH"], user_id):
+                # Do not recreate a missing account from session-cookie data. That
+                # creates an account with no usable password and masks lost DB data.
+                session.clear()
+                return jsonify({"error": "Authentication required", "logged_in": False}), 401
             return f(*args, **kwargs)
         return decorated_function
 
@@ -82,6 +92,8 @@ def create_app(db_path=None):
         except ValueError as e:
             return jsonify({"error": str(e)}), 409
         except Exception as e:
+            if database.is_integrity_error(e):
+                return jsonify({"error": str(e)}), 409
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/auth/login", methods=["POST"])
@@ -218,8 +230,12 @@ def create_app(db_path=None):
         try:
             folder = database.create_folder(app.config["DB_PATH"], name, parent_id=parent_id, user_id=user_id)
             return jsonify(folder), 201
-        except (sqlite3.IntegrityError, ValueError) as e:
+        except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            if database.is_integrity_error(e):
+                return jsonify({"error": str(e)}), 400
+            raise
 
     @app.route("/api/folders/<int:folder_id>", methods=["PUT"])
     @login_required
@@ -258,8 +274,12 @@ def create_app(db_path=None):
                 user_id=user_id
             )
             return jsonify(updated)
-        except (sqlite3.IntegrityError, ValueError) as e:
+        except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            if database.is_integrity_error(e):
+                return jsonify({"error": str(e)}), 400
+            raise
 
     @app.route("/api/folders/<int:folder_id>", methods=["DELETE"])
     @login_required

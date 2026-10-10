@@ -185,6 +185,7 @@ SimpleNotes is fully pre-configured for one-click serverless deployment on **Ver
 3. **Configure Environment Variables in Vercel**:
    In your Vercel Project settings (**Settings** -> **Environment Variables**), add:
    - `SECRET_KEY`: A secure random secret string for session cookies.
+   - Connect a **Turso** database from the Vercel Marketplace to this project. The integration supplies `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`, which the app uses for persistent users, notes, folders, and password reset codes. Deploy again after connecting it.
    - For real emails, choose either **Resend** or **Gmail** (see instructions below):
      - **Resend**: `RESEND_API_KEY` = `re_...`
      - **Gmail**: `GMAIL_USER` = `you@gmail.com` and `GMAIL_APP_PASSWORD` = `xxxx xxxx xxxx xxxx`
@@ -210,7 +211,7 @@ SimpleNotes is fully pre-configured for one-click serverless deployment on **Ver
    vercel --prod
    ```
 
-> **Note on Storage on Vercel**: Vercel executes applications inside ephemeral serverless containers with a read-only root file system. SimpleNotes automatically detects the Vercel environment (`VERCEL=1`) and defaults database storage to `/tmp/notes.db`.
+> **Persistent storage on Vercel**: Vercel Functions only provide temporary `/tmp` storage, so a local SQLite file there cannot safely hold accounts or notes. Connect a Turso database through the Vercel Marketplace; the app then reads `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` and stores data in Turso. On Vercel, the app now refuses to start without both values instead of silently using temporary storage. Data that has already disappeared from `/tmp` cannot be recovered by this change; restore it from an export or other backup if one exists.
 
 ---
 
