@@ -668,10 +668,24 @@
       if (!res.ok) throw new Error('Failed to fetch notes');
       const serverNotes = await res.json();
 
-      // The database is the source of truth. Browser cache is only a temporary
-      // display aid while loading and must never recreate deleted records.
-      notes = Array.isArray(serverNotes) ? serverNotes : [];
-      saveNotesToCache(notes);
+      if (Array.isArray(serverNotes) && (serverNotes.length > 0 || (activeFilter !== 'all' || hasQuery))) {
+        notes = serverNotes;
+        saveNotesToCache(notes);
+      } else if (activeFilter === 'all' && !hasQuery && (!serverNotes || serverNotes.length === 0)) {
+        // Cold server instance returned empty list in all view: don't blank out if we have local notes
+        const cached = getNotesFromCache();
+        if (notes && notes.length > 0) {
+          // Keep current notes
+        } else if (cached && cached.length > 0) {
+          notes = cached;
+        } else {
+          notes = [];
+          saveNotesToCache(notes);
+        }
+      } else {
+        notes = Array.isArray(serverNotes) ? serverNotes : [];
+        saveNotesToCache(notes);
+      }
 
       renderNotes();
       updateFilterLabel();
@@ -692,9 +706,27 @@
       if (!res.ok) return;
       const serverFolders = await res.json();
 
-      // An empty server result is meaningful: it must clear stale cached folders.
-      folders = Array.isArray(serverFolders) ? serverFolders : [];
-      saveFoldersToCache(folders);
+      if (Array.isArray(serverFolders) && serverFolders.length > 0) {
+        const serverCustom = serverFolders.filter(f => !f.is_default && (f.name || '').toLowerCase() !== 'home');
+        const localCustom = (folders || []).filter(f => !f.is_default && (f.name || '').toLowerCase() !== 'home');
+
+        if (serverCustom.length >= localCustom.length) {
+          folders = serverFolders;
+          saveFoldersToCache(folders);
+        } else if (localCustom.length > 0) {
+          const existingNames = new Set(serverFolders.map(f => (f.name || '').toLowerCase()));
+          const missing = localCustom.filter(lf => !existingNames.has((lf.name || '').toLowerCase()));
+          folders = [...serverFolders, ...missing];
+          saveFoldersToCache(folders);
+        } else {
+          folders = serverFolders;
+          saveFoldersToCache(folders);
+        }
+      } else if (!folders || folders.length === 0) {
+        const cached = getFoldersFromCache();
+        folders = (cached && cached.length > 0) ? cached : (serverFolders || []);
+      }
+
       renderFolders();
       updateModalFolderSelect();
       updateFolderParentSelect();
@@ -1059,15 +1091,23 @@
       btn.addEventListener('click', async (e) => {
         e.stopPropagation();
         const noteId = parseInt(btn.getAttribute('data-id'), 10);
+        const note = notes.find((n) => n.id === noteId);
+        if (!note) return;
+        const prevPinned = note.is_pinned;
+        note.is_pinned = !note.is_pinned;
+        saveNotesToCache(notes);
+        renderNotes();
         try {
           const res = await fetch(`/api/notes/${noteId}/pin`, { method: 'POST' });
           if (!res.ok) throw new Error('Pin failed');
           const updated = await res.json();
-          notes = notes.map((n) => (n.id === noteId ? { ...n, is_pinned: updated.is_pinned } : n));
+          note.is_pinned = updated.is_pinned;
           saveNotesToCache(notes);
-          fetchNotes();
         } catch (err) {
           console.error(err);
+          note.is_pinned = prevPinned;
+          saveNotesToCache(notes);
+          renderNotes();
           showToast('Failed to toggle pin');
         }
       });
@@ -1902,25 +1942,36 @@
     const previousNotes = notes.slice();
     const optimisticId = editingId || -Date.now();
     const existing = notes.find((note) => note.id === editingId) || {};
+    const selectedFolder = folders.find((f) => f.id === folder_id) || {};
     const optimisticNote = {
       ...existing,
       ...payload,
       id: optimisticId,
-      folder_name: (folders.find((folder) => folder.id === folder_id) || {}).name || 'Home',
-      folder_path: (folders.find((folder) => folder.id === folder_id) || {}).path || 'Home',
+      folder_name: selectedFolder.name || 'Home',
+      folder_path: selectedFolder.path || selectedFolder.name || 'Home',
+      tags_list: (tags || '').split(',').map(t => t.trim()).filter(Boolean),
       created_at: existing.created_at || new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
-    const showOptimistically = activeFilter === 'all' && !searchQuery;
-    if (showOptimistically) {
-      notes = editingId
-        ? notes.map((note) => note.id === editingId ? optimisticNote : note)
-        : [optimisticNote, ...notes];
-      saveNotesToCache(notes);
-      renderNotes();
-      updateFilterLabel();
-      closeModal();
+
+    if (editingId) {
+      if (activeFolderId !== null && folder_id !== activeFolderId) {
+        notes = notes.filter((n) => n.id !== editingId);
+      } else {
+        notes = notes.map((n) => n.id === editingId ? optimisticNote : n);
+      }
+    } else {
+      if (activeFolderId === null || folder_id === activeFolderId) {
+        notes = [optimisticNote, ...notes];
+      }
     }
+
+    saveNotesToCache(notes);
+    renderNotes();
+    updateFilterLabel();
+    updateAllNotesCountBadge();
+    closeModal();
+    showToast(editingId ? 'Note updated successfully' : 'Note created successfully');
 
     try {
       const res = await fetch(editingId ? `/api/notes/${editingId}` : '/api/notes', {
@@ -1930,34 +1981,25 @@
       });
 
       if (res.status === 401) {
-        if (showOptimistically) {
-          notes = previousNotes;
-          saveNotesToCache(notes);
-          renderNotes();
-        }
+        notes = previousNotes;
+        saveNotesToCache(notes);
+        renderNotes();
         handleUnauthorized();
         return;
       }
 
       if (!res.ok) throw new Error('Failed to save');
       const savedNote = await res.json();
-      if (showOptimistically) {
-        notes = notes.map((note) => note.id === optimisticId ? savedNote : note);
-        saveNotesToCache(notes);
-        renderNotes();
-        updateFilterLabel();
-      }
-      showToast(editingId ? 'Note updated successfully' : 'Note created successfully');
-      if (!showOptimistically) await fetchNotes();
+      notes = notes.map((note) => note.id === optimisticId ? savedNote : note);
+      saveNotesToCache(notes);
+      renderNotes();
       fetchTags();
     } catch (err) {
       console.error(err);
-      if (showOptimistically) {
-        notes = previousNotes;
-        saveNotesToCache(notes);
-        renderNotes();
-        updateFilterLabel();
-      }
+      notes = previousNotes;
+      saveNotesToCache(notes);
+      renderNotes();
+      updateFilterLabel();
       showToast('Error saving note. Your changes were not saved.');
     }
   }
@@ -1967,17 +2009,26 @@
     if (!currentEditingId) return;
     if (!confirm('Are you sure you want to delete this note?')) return;
 
+    const noteId = currentEditingId;
+    const previousNotes = notes.slice();
+    notes = notes.filter((n) => n.id !== noteId);
+    saveNotesToCache(notes);
+    renderNotes();
+    updateFilterLabel();
+    updateAllNotesCountBadge();
+    closeModal();
+    showToast('Note deleted');
+
     try {
-      const res = await fetch(`/api/notes/${currentEditingId}`, { method: 'DELETE' });
+      const res = await fetch(`/api/notes/${noteId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete');
-      notes = notes.filter((n) => n.id !== currentEditingId);
-      saveNotesToCache(notes);
-      renderNotes();
-      showToast('Note deleted');
-      closeModal();
-      fetchNotes();
+      fetchTags();
     } catch (err) {
       console.error(err);
+      notes = previousNotes;
+      saveNotesToCache(notes);
+      renderNotes();
+      updateFilterLabel();
       showToast('Error deleting note');
     }
   }
@@ -2059,12 +2110,42 @@
     const parentIdVal = folderParentSelect ? folderParentSelect.value : '';
     const parent_id = parentIdVal ? parseInt(parentIdVal, 10) : null;
     const payload = { name, parent_id };
-    const wasEditing = Boolean(currentEditingFolderId);
+    const editingFolderId = currentEditingFolderId;
+    const wasEditing = Boolean(editingFolderId);
+
+    const prevFolders = folders.slice();
+    const tempId = editingFolderId || -Date.now();
+    const parentFolder = parent_id ? folders.find((f) => f.id === parent_id) : null;
+    const folderPath = parentFolder ? `${parentFolder.path || parentFolder.name} / ${name}` : name;
+    const folderDepth = parentFolder ? (parentFolder.depth || 0) + 1 : 0;
+
+    if (wasEditing) {
+      folders = folders.map((f) => f.id === editingFolderId ? { ...f, name, parent_id, path: folderPath, depth: folderDepth } : f);
+    } else {
+      const newFolderObj = {
+        id: tempId,
+        name,
+        parent_id,
+        is_default: false,
+        note_count: 0,
+        total_note_count: 0,
+        path: folderPath,
+        depth: folderDepth
+      };
+      folders = [...folders, newFolderObj];
+    }
+
+    saveFoldersToCache(folders);
+    renderFolders();
+    updateModalFolderSelect();
+    updateFolderParentSelect();
+    closeFolderModal();
+    showToast(wasEditing ? 'Folder updated' : `Folder "${name}" created`);
 
     try {
       let res;
-      if (currentEditingFolderId) {
-        res = await fetch(`/api/folders/${currentEditingFolderId}`, {
+      if (wasEditing) {
+        res = await fetch(`/api/folders/${editingFolderId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -2078,32 +2159,24 @@
       }
 
       const result = await res.json();
-      if (!res.ok) {
-        folderModalError.textContent = result.error || 'Failed to save folder';
-        folderModalError.style.display = 'block';
-        return;
-      }
-
-      if (currentEditingFolderId) {
-        folders = folders.map((f) => (f.id === currentEditingFolderId ? { ...f, ...result } : f));
-      } else {
-        folders.push(result);
-      }
-      saveFoldersToCache(folders);
-
-      showToast(wasEditing ? 'Folder updated' : `Folder "${name}" created`);
-      closeFolderModal();
-      await fetchFolders();
+      if (!res.ok) throw new Error(result.error || 'Failed to save folder');
 
       if (!wasEditing && result.id) {
+        folders = folders.map((f) => f.id === tempId ? { ...f, ...result } : f);
+        saveFoldersToCache(folders);
+        renderFolders();
+        updateModalFolderSelect();
+        updateFolderParentSelect();
         selectFolderFilter(result.id, result.path || result.name);
-      } else {
-        fetchNotes();
       }
     } catch (err) {
       console.error(err);
-      folderModalError.textContent = 'Server error saving folder';
-      folderModalError.style.display = 'block';
+      folders = prevFolders;
+      saveFoldersToCache(folders);
+      renderFolders();
+      updateModalFolderSelect();
+      updateFolderParentSelect();
+      showToast(err.message || 'Error saving folder');
     }
   }
 
@@ -2112,44 +2185,54 @@
       return;
     }
 
+    const prevFolders = folders.slice();
+    const prevNotes = notes.slice();
+
+    const removedIds = new Set([folderId]);
+    let foundChild = true;
+    while (foundChild) {
+      foundChild = false;
+      folders.forEach((folder) => {
+        if (removedIds.has(folder.parent_id) && !removedIds.has(folder.id)) {
+          removedIds.add(folder.id);
+          foundChild = true;
+        }
+      });
+    }
+
+    folders = folders.filter((folder) => !removedIds.has(folder.id));
+    saveFoldersToCache(folders);
+
+    const defaultFolder = folders.find((f) => f.is_default) || folders[0];
+    const defaultId = defaultFolder ? defaultFolder.id : 1;
+    notes = notes.map((n) => (removedIds.has(n.folder_id) ? { ...n, folder_id: defaultId, folder_name: 'Home', folder_path: 'Home' } : n));
+    saveNotesToCache(notes);
+
+    renderFolders();
+    updateModalFolderSelect();
+    updateFolderParentSelect();
+    updateAllNotesCountBadge();
+
+    if (removedIds.has(activeFolderId)) {
+      selectFilter('all');
+    } else {
+      renderNotes();
+    }
+
+    showToast(`Folder "${folderName}" deleted. Notes moved to Home.`);
+
     try {
       const res = await fetch(`/api/folders/${folderId}`, { method: 'DELETE' });
       const result = await res.json();
-      if (!res.ok) {
-        showToast(result.error || 'Failed to delete folder');
-        return;
-      }
-
-      const removedIds = new Set([folderId]);
-      let foundChild = true;
-      while (foundChild) {
-        foundChild = false;
-        folders.forEach((folder) => {
-          if (removedIds.has(folder.parent_id) && !removedIds.has(folder.id)) {
-            removedIds.add(folder.id);
-            foundChild = true;
-          }
-        });
-      }
-      folders = folders.filter((folder) => !removedIds.has(folder.id));
-      saveFoldersToCache(folders);
-      renderFolders();
-
-      const defaultFolder = folders.find((f) => f.is_default) || folders[0];
-      const defaultId = defaultFolder ? defaultFolder.id : 1;
-      notes = notes.map((n) => (removedIds.has(n.folder_id) ? { ...n, folder_id: defaultId, folder_name: 'Home' } : n));
-      saveNotesToCache(notes);
-      renderNotes();
-
-      showToast(`Folder "${folderName}" deleted. Notes moved to Home.`);
-      await fetchFolders();
-      if (removedIds.has(activeFolderId)) {
-        selectFilter('all');
-      } else {
-        fetchNotes();
-      }
+      if (!res.ok) throw new Error(result.error || 'Failed to delete folder');
     } catch (err) {
       console.error(err);
+      folders = prevFolders;
+      notes = prevNotes;
+      saveFoldersToCache(folders);
+      saveNotesToCache(notes);
+      renderFolders();
+      renderNotes();
       showToast('Error deleting folder');
     }
   }

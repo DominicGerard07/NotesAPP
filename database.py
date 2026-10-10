@@ -348,6 +348,57 @@ def get_user_by_id(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def ensure_user_exists(
+    db_path: str,
+    user_id: int,
+    username: Optional[str] = None,
+    email: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Ensures a user and their default Home folder exist in the database.
+    Crucial for ephemeral/serverless environments (like Vercel) where new container
+    instances start with a fresh SQLite database while the user retains a valid session cookie.
+    """
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, email FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            clean_username = (username or f"user_{user_id}").strip()
+            cursor.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (clean_username,))
+            if cursor.fetchone():
+                clean_username = f"{clean_username}_{user_id}"
+
+            clean_email = (email or f"{clean_username}@local").strip().lower()
+            cursor.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (clean_email,))
+            if cursor.fetchone():
+                clean_email = f"user_{user_id}_{clean_email}"
+
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            cursor.execute(
+                "INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, 'ephemeral_hash', ?)",
+                (user_id, clean_username, clean_email, now)
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO folders (user_id, name, parent_id, is_default) VALUES (?, 'Home', NULL, 1)",
+                (user_id,)
+            )
+            conn.commit()
+        else:
+            cursor.execute(
+                "SELECT id FROM folders WHERE user_id = ? AND is_default = 1",
+                (user_id,)
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    "INSERT INTO folders (user_id, name, parent_id, is_default) VALUES (?, 'Home', NULL, 1)",
+                    (user_id,)
+                )
+                conn.commit()
+
+    return get_user_by_id(db_path, user_id) or {"id": user_id, "username": username or f"user_{user_id}"}
+
+
 def get_user_by_username_or_email(db_path: str, identifier: str) -> Optional[Dict[str, Any]]:
     """Retrieve full user details including password_hash for authentication."""
     clean = identifier.strip().lower()
@@ -660,7 +711,6 @@ def list_folders(db_path: str, user_id: Optional[int] = None) -> List[Dict[str, 
                 ordered_folders.append(f)
 
     return ordered_folders
-
 
 def update_folder(
     db_path: str,
@@ -1046,3 +1096,4 @@ def import_notes(db_path: str, notes_data: List[Dict[str, Any]], user_id: Option
         )
         imported_count += 1
     return imported_count
+

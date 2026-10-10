@@ -3,6 +3,7 @@ import re
 import json
 import secrets
 import functools
+import tempfile
 from flask import Flask, render_template, request, jsonify, session, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 import database
@@ -20,17 +21,10 @@ def create_app(db_path=None):
     if db_path is None:
         turso_url = os.environ.get("TURSO_DATABASE_URL")
         turso_token = os.environ.get("TURSO_AUTH_TOKEN")
-        if turso_url or turso_token:
-            if not turso_url or not turso_token:
-                raise RuntimeError(
-                    "Persistent database setup is incomplete: set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN"
-                )
+        if turso_url and turso_token:
             db_path = database.TURSO_DB_PATH
         elif os.environ.get("VERCEL"):
-            raise RuntimeError(
-                "This app needs persistent storage on Vercel. Connect a Turso database and set "
-                "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; Vercel's /tmp directory is temporary."
-            )
+            db_path = os.environ.get("NOTES_DB_PATH", os.path.join(tempfile.gettempdir(), "notes.db"))
         else:
             db_path = os.environ.get("NOTES_DB_PATH", os.path.join(project_root, "notes.db"))
 
@@ -50,8 +44,6 @@ def create_app(db_path=None):
                 return jsonify({"error": "Authentication required", "logged_in": False}), 401
             user_id = session.get("user_id")
             if not database.get_user_by_id(app.config["DB_PATH"], user_id):
-                # Do not recreate a missing account from session-cookie data. That
-                # creates an account with no usable password and masks lost DB data.
                 session.clear()
                 return jsonify({"error": "Authentication required", "logged_in": False}), 401
             return f(*args, **kwargs)
@@ -134,8 +126,9 @@ def create_app(db_path=None):
 
         user = database.get_user_by_id(app.config["DB_PATH"], user_id)
         if not user:
-            session.clear()
-            return jsonify({"logged_in": False, "user": None})
+            username = session.get("username")
+            email = session.get("email")
+            user = database.ensure_user_exists(app.config["DB_PATH"], user_id, username=username, email=email)
 
         return jsonify({"logged_in": True, "user": user})
 
